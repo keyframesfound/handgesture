@@ -1,191 +1,217 @@
 import cv2
 import mediapipe as mp
-import pyautogui
-import time
-from datetime import datetime
 import numpy as np
+import pyautogui
+from datetime import datetime
+import os
+import subprocess
+import time
+import speech_recognition as sr
 import threading
-import queue
+import pyperclip
+from pynput.keyboard import Key, Controller
 
-# Initialize MediaPipe Hand solutions
+# Initialize MediaPipe Hand detection
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     static_image_mode=False,
     max_num_hands=1,
     min_detection_confidence=0.7,
-    min_tracking_confidence=0.5
-)
+    min_tracking_confidence=0.7)
 mp_draw = mp.solutions.drawing_utils
 
-# Initialize the webcam
+# Initialize speech recognizer
+recognizer = sr.Recognizer()
+keyboard = Controller()
+
+# Start video capture
 cap = cv2.VideoCapture(0)
-# Set a lower resolution to reduce processing load
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-# Cooldown for screenshots (3 seconds)
-SCREENSHOT_COOLDOWN = 3
-last_screenshot_time = 0
+# Variables to track the last action time to prevent multiple triggers
+last_action_time = 0
+ACTION_COOLDOWN = 2  # Cooldown in seconds
 
-# Add new global variables after the last_screenshot_time
+# Variable to track recording state
 is_recording = False
-video_writer = None
-recording_start_time = 0
+is_listening = False
 
-# Flag to track thumbs-up gesture state across frames.
-thumbs_up_active = False
-
-# New globals for multithreading recording
-record_queue = None
-record_thread = None
-record_thread_running = False
-
-def is_fist_closed(hand_landmarks):
-    # Get finger tip and pip landmarks
-    finger_tips = [8, 12, 16, 20]  # Index, Middle, Ring, Pinky tips
-    finger_pips = [6, 10, 14, 18]  # Index, Middle, Ring, Pinky pips
+def listen_and_type():
+    """Listen for speech and type it into Spotlight"""
+    global is_listening
     
-    # Check if fingers are closed
-    closed_fingers = 0
-    for tip, pip in zip(finger_tips, finger_pips):
-        if hand_landmarks.landmark[tip].y > hand_landmarks.landmark[pip].y:
-            closed_fingers += 1
+    try:
+        with sr.Microphone() as source:
+            print("Listening... Speak now!")
+            recognizer.adjust_for_ambient_noise(source)
+            audio = recognizer.listen(source, timeout=5)
+            
+            try:
+                text = recognizer.recognize_google(audio)
+                print(f"You said: {text}")
+                
+                # Copy text to clipboard
+                pyperclip.copy(text)
+                
+                # Paste text (Command + V)
+                time.sleep(0.5)  # Wait for Spotlight to be ready
+                pyautogui.hotkey('command', 'v')
+                
+                # Press return to execute
+                time.sleep(0.2)
+                pyautogui.press('return')
+                
+            except sr.UnknownValueError:
+                print("Could not understand audio")
+            except sr.RequestError as e:
+                print(f"Could not request results; {e}")
     
-    # If all fingers are closed (below their pips), it's a fist
-    return closed_fingers >= 3
+    except Exception as e:
+        print(f"Error in speech recognition: {e}")
+    
+    finally:
+        is_listening = False
 
-def is_thumbs_up(hand_landmarks):
-    # Thumb tip and IP (Inter Phalangeal Joint)
+def calculate_thumb_up(hand_landmarks):
+    """Check if gesture is thumbs up"""
     thumb_tip = hand_landmarks.landmark[4]
-    thumb_ip = hand_landmarks.landmark[3]
-    
-    # Other finger landmarks
-    finger_tips = [8, 12, 16, 20]  # Index, Middle, Ring, Pinky tips
-    finger_pips = [6, 10, 14, 18]  # Index, Middle, Ring, Pinky pips
+    thumb_base = hand_landmarks.landmark[2]
+    other_fingers_tips = [8, 12, 16, 20]  # Index, Middle, Ring, Pinky tips
+    other_fingers_bases = [6, 10, 14, 18]  # Corresponding bases
     
     # Check if thumb is pointing up
-    thumb_up = thumb_tip.y < thumb_ip.y
+    thumb_is_up = thumb_tip.y < thumb_base.y
     
     # Check if other fingers are closed
     other_fingers_closed = all(
-        hand_landmarks.landmark[tip].y > hand_landmarks.landmark[pip].y
-        for tip, pip in zip(finger_tips, finger_pips)
+        hand_landmarks.landmark[tip].y > hand_landmarks.landmark[base].y
+        for tip, base in zip(other_fingers_tips, other_fingers_bases)
     )
     
-    return thumb_up and other_fingers_closed
+    return thumb_is_up and other_fingers_closed
 
-def take_screenshot():
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f'screenshot_{timestamp}.png'
-    screenshot = pyautogui.screenshot()
-    screenshot.save(filename)
-    print(f"Screenshot saved as {filename}")
+def calculate_peace_sign(hand_landmarks):
+    """Check if gesture is peace sign (V sign)"""
+    index_tip = hand_landmarks.landmark[8]
+    middle_tip = hand_landmarks.landmark[12]
+    ring_tip = hand_landmarks.landmark[16]
+    pinky_tip = hand_landmarks.landmark[20]
+    
+    # Check if index and middle fingers are up
+    index_up = index_tip.y < hand_landmarks.landmark[6].y
+    middle_up = middle_tip.y < hand_landmarks.landmark[10].y
+    
+    # Check if other fingers are down
+    ring_down = ring_tip.y > hand_landmarks.landmark[14].y
+    pinky_down = pinky_tip.y > hand_landmarks.landmark[18].y
+    
+    return index_up and middle_up and ring_down and pinky_down
 
-def record_video_worker():
-    global record_thread_running, video_writer, record_queue
-    while record_thread_running or (record_queue and not record_queue.empty()):
-        try:
-            frame = record_queue.get(timeout=0.1)
-            if video_writer is not None:
-                video_writer.write(frame)
-        except queue.Empty:
-            continue
-
-def start_recording():
-    global video_writer, is_recording, recording_start_time, record_queue, record_thread, record_thread_running
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f'recording_{timestamp}.mp4'
-    frame_size = (int(cap.get(3)), int(cap.get(4)))
-    video_writer = cv2.VideoWriter(
-        filename,
-        cv2.VideoWriter_fourcc(*'mp4v'),
-        30,
-        frame_size
+def calculate_closed_fist(hand_landmarks):
+    """Check if all fingers are closed (fist)"""
+    finger_tips = [8, 12, 16, 20]  # Index, Middle, Ring, Pinky tips
+    finger_bases = [6, 10, 14, 18]  # Corresponding bases
+    thumb_tip = 4
+    thumb_base = 2
+    
+    # Check if all fingers are closed
+    fingers_closed = all(
+        hand_landmarks.landmark[tip].y > hand_landmarks.landmark[base].y
+        for tip, base in zip(finger_tips, finger_bases)
     )
-    is_recording = True
-    recording_start_time = time.time()
-    # Initialize the queue and start the recorder thread
-    record_queue = queue.Queue()
-    record_thread_running = True
-    record_thread = threading.Thread(target=record_video_worker)
-    record_thread.daemon = True
-    record_thread.start()
-    print(f"Started recording: {filename}")
+    
+    # Check thumb position
+    thumb_closed = hand_landmarks.landmark[thumb_tip].x > hand_landmarks.landmark[thumb_base].x
+    
+    return fingers_closed and thumb_closed
 
-def stop_recording():
-    global video_writer, is_recording, record_thread_running, record_thread
-    record_thread_running = False
-    if record_thread is not None:
-        record_thread.join()
-    if video_writer is not None:
-        video_writer.release()
-    is_recording = False
-    print("Recording stopped")
+def open_spotlight_with_voice():
+    """Open Spotlight and start voice recognition"""
+    global is_listening
+    
+    if not is_listening:
+        # Open Spotlight
+        pyautogui.hotkey('command', 'space')
+        print("Opened Spotlight with voice recognition")
+        
+        # Start voice recognition in a separate thread
+        is_listening = True
+        threading.Thread(target=listen_and_type).start()
+
+def toggle_screen_recording():
+    """Simulate Command + Shift + 5 to toggle screen recording"""
+    pyautogui.hotkey('command', 'shift', '5')
+    print("Toggled screen recording menu")
+
+def start_stop_recording():
+    """Start/Stop screen recording using Command + Shift + 5"""
+    global is_recording
+    if not is_recording:
+        # Start recording
+        pyautogui.hotkey('command', 'shift', '5')
+        time.sleep(1)  # Wait for menu to appear
+        pyautogui.press('space')  # Press space to start recording
+        is_recording = True
+        print("Started recording")
+    else:
+        # Stop recording
+        pyautogui.hotkey('command', 'control', 'esc')  # Stop recording
+        is_recording = False
+        print("Stopped recording")
 
 def main():
-    global last_screenshot_time, is_recording, thumbs_up_active, record_queue
+    global last_action_time
+    
+    print("Gesture Controls:")
+    print("- Thumbs Up: Open Spotlight with Voice Recognition")
+    print("- Peace Sign: Toggle Recording Menu")
+    print("- Closed Fist: Start/Stop Recording")
+    print("Press 'q' to quit")
     
     while cap.isOpened():
         success, image = cap.read()
         if not success:
+            print("Failed to capture frame")
             continue
 
-        # Flip the image once for selfie-view
-        flipped_image = cv2.flip(image, 1)
-        # Use the flipped image for both display and landmark processing
-        image_rgb = cv2.cvtColor(flipped_image, cv2.COLOR_BGR2RGB)
+        # Flip the image horizontally for a later selfie-view display
+        image = cv2.flip(image, 1)
+        
+        # Convert the BGR image to RGB
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Process the image and detect hands
         results = hands.process(image_rgb)
 
-        # Reset thumbs_up_active if no hand is detected.
-        current_thumbs = False
-        
         if results.multi_hand_landmarks:
             for hand_landmarks in results.multi_hand_landmarks:
                 # Draw hand landmarks
-                mp_draw.draw_landmarks(
-                    flipped_image,
-                    hand_landmarks,
-                    mp_hands.HAND_CONNECTIONS
-                )
+                mp_draw.draw_landmarks(image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
                 
-                # Check for fist gesture (screenshot)
-                if is_fist_closed(hand_landmarks):
-                    current_time = time.time()
-                    if current_time - last_screenshot_time >= SCREENSHOT_COOLDOWN:
-                        take_screenshot()
-                        last_screenshot_time = current_time
-                
-                # Use edge detection for thumbs-up to toggle recording.
-                if is_thumbs_up(hand_landmarks):
-                    current_thumbs = True
-                    if not thumbs_up_active:
-                        if not is_recording:
-                            start_recording()
-                        else:
-                            stop_recording()
-        
-        # Update state at end of frame.
-        thumbs_up_active = current_thumbs
+                current_time = time.time()
+                if current_time - last_action_time >= ACTION_COOLDOWN:
+                    # Check for thumbs up
+                    if calculate_thumb_up(hand_landmarks):
+                        open_spotlight_with_voice()
+                        last_action_time = current_time
+                    
+                    # Check for peace sign
+                    elif calculate_peace_sign(hand_landmarks):
+                        toggle_screen_recording()
+                        last_action_time = current_time
+                    
+                    # Check for closed fist
+                    elif calculate_closed_fist(hand_landmarks):
+                        start_stop_recording()
+                        last_action_time = current_time
 
-        # Recording: write the already flipped image without re-flipping
-        if is_recording:
-            cv2.circle(flipped_image, (30, 30), 10, (0, 0, 255), -1)
-            # Enqueue frame for recording; avoid adding if queue is too large
-            if record_queue is not None and record_queue.qsize() < 10:
-                record_queue.put(flipped_image.copy())
-        
         # Display the image
-        cv2.imshow('Hand Gesture Recognition', flipped_image)
+        cv2.imshow('Hand Gesture Recognition', image)
         
         # Break the loop if 'q' is pressed
         if cv2.waitKey(1) & 0xFF == ord('q'):
-            if is_recording:
-                stop_recording()
             break
 
     # Clean up
-    if video_writer is not None:
-        video_writer.release()
     cap.release()
     cv2.destroyAllWindows()
 
